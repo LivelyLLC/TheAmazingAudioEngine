@@ -1025,6 +1025,8 @@ void AEAudioControllerSendAsynchronousMessageToMainThread(AEAudioController     
  */
 - (void)outputAveragePowerLevel:(Float32*)averagePower peakHoldLevel:(Float32*)peakLevel;
 
+- (void)stereoOutputAveragePowerLevelL:(Float32*)averagePowerL averagePowerLevelR:(Float32*)averagePowerR peakHoldLevelL:(Float32*)peakLevelL peakHoldLevelR:(Float32*)peakLevelR;
+
 /*!
  * Get output power level information for a particular group, since this method was last called
  *
@@ -1034,6 +1036,8 @@ void AEAudioControllerSendAsynchronousMessageToMainThread(AEAudioController     
  */
 - (void)averagePowerLevel:(Float32*)averagePower peakHoldLevel:(Float32*)peakLevel forGroup:(AEChannelGroupRef)group;
 
+- (void)stereoAveragePowerLevelL:(Float32*)averagePowerL averagePowerLevelR:(Float32*)averagePowerR peakHoldLevelL:(Float32*)peakLevelL peakHoldLevelR:(Float32*)peakLevelR forGroup:(AEChannelGroupRef)group;
+
 /*!
  * Get input power level information since this method was last called
  *
@@ -1041,6 +1045,8 @@ void AEAudioControllerSendAsynchronousMessageToMainThread(AEAudioController     
  * @param peakLevel If not NULL, on output will be set to the peak level of the most recent input audio, in decibels
  */
 - (void)inputAveragePowerLevel:(Float32*)averagePower peakHoldLevel:(Float32*)peakLevel;
+
+- (void)stereoInputAveragePowerLevelL:(Float32*)averagePowerL averagePowerLevelR:(Float32*)averagePowerR peakHoldLevelL:(Float32*)peakLevelL peakHoldLevelR:(Float32*)peakLevelR;
 
 ///@}
 #pragma mark - Utilities

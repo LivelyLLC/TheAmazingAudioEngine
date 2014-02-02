@@ -162,6 +162,22 @@ typedef struct __audio_level_monitor_t {
     BOOL                reset;
 } audio_level_monitor_t;
 
+typedef struct __stereo_audio_level_monitor_t {
+    BOOL                monitoringEnabled;
+    float               meanAccumulatorL;
+    int                 meanBlockCountL;
+    Float32             peakL;
+    Float32             averageL;
+    float               meanAccumulatorR;
+    int                 meanBlockCountR;
+    Float32             peakR;
+    Float32             averageR;
+    AEFloatConverter   *floatConverter;
+    AudioBufferList    *scratchBuffer;
+    int                 channels;
+    BOOL                reset;
+} stereo_audio_level_monitor_t;
+
 /*!
  * Source types
  */
@@ -205,6 +221,7 @@ typedef struct _channel_group_t {
     AUNode              converterNode;
     AudioUnit           converterUnit;
     audio_level_monitor_t level_monitor_data;
+    stereo_audio_level_monitor_t stereo_level_monitor_data;
 } channel_group_t;
 
 #pragma mark Messaging
@@ -262,6 +279,7 @@ typedef struct {
     int                 _pendingResponses;
     
     audio_level_monitor_t _inputLevelMonitorData;
+    stereo_audio_level_monitor_t    _stereoInputLevelMonitorData;
     BOOL                _usingAudiobusInput;
 }
 
@@ -271,6 +289,7 @@ typedef struct {
 static void processPendingMessagesOnRealtimeThread(AEAudioController *THIS);
 static void handleCallbacksForChannel(AEChannelRef channel, const AudioTimeStamp *inTimeStamp, UInt32 inNumberFrames, AudioBufferList *ioData);
 static void performLevelMonitoring(audio_level_monitor_t* monitor, AudioBufferList *buffer, UInt32 numberFrames);
+static void performStereoLevelMonitoring(stereo_audio_level_monitor_t* monitor, AudioBufferList *buffer, UInt32 numberFrames);
 
 @property (nonatomic, retain, readwrite) NSString *audioRoute;
 @property (nonatomic, assign, readwrite) float currentBufferDuration;
@@ -452,6 +471,10 @@ static OSStatus channelAudioProducer(void *userInfo, AudioBufferList *audio, UIn
         
         if ( group->level_monitor_data.monitoringEnabled ) {
             performLevelMonitoring(&group->level_monitor_data, audio, *frames);
+        }
+        
+        if ( group->stereo_level_monitor_data.monitoringEnabled ) {
+            performStereoLevelMonitoring(&group->stereo_level_monitor_data, audio, *frames);
         }
         
         // Advance the sample time, to make sure we continue to render if we're called again with the same arguments
@@ -646,6 +669,9 @@ static OSStatus inputAvailableCallback(void *inRefCon, AudioUnitRenderActionFlag
     if ( THIS->_inputLevelMonitorData.monitoringEnabled ) {
         performLevelMonitoring(&THIS->_inputLevelMonitorData, THIS->_inputAudioBufferList, inNumberFrames);
     }
+    if (THIS->_stereoInputLevelMonitorData.monitoringEnabled && THIS->_stereoInputLevelMonitorData.channels == 2) {
+        performStereoLevelMonitoring(&THIS->_stereoInputLevelMonitorData, THIS->_inputAudioBufferList, inNumberFrames);
+    }
     
     return result;
 }
@@ -660,6 +686,10 @@ static OSStatus groupRenderNotifyCallback(void *inRefCon, AudioUnitRenderActionF
         
         if ( group->level_monitor_data.monitoringEnabled ) {
             performLevelMonitoring(&group->level_monitor_data, ioData, inNumberFrames);
+        }
+
+        if ( group->stereo_level_monitor_data.monitoringEnabled ) {
+            performStereoLevelMonitoring(&group->stereo_level_monitor_data, ioData, inNumberFrames);
         }
     }
     
@@ -856,6 +886,14 @@ static OSStatus topRenderNotifyCallback(void *inRefCon, AudioUnitRenderActionFla
     
     if ( _inputLevelMonitorData.floatConverter ) {
         [_inputLevelMonitorData.floatConverter release];
+    }
+
+    if ( _stereoInputLevelMonitorData.scratchBuffer ) {
+        AEFreeAudioBufferList(_stereoInputLevelMonitorData.scratchBuffer);
+    }
+    
+    if ( _stereoInputLevelMonitorData.floatConverter ) {
+        [_stereoInputLevelMonitorData.floatConverter release];
     }
     
     if ( _inputAudioBufferList ) {
@@ -1594,6 +1632,10 @@ static BOOL AEAudioControllerHasPendingMainThreadMessages(AEAudioController *THI
     return [self averagePowerLevel:averagePower peakHoldLevel:peakLevel forGroup:_topGroup];
 }
 
+- (void)stereoOutputAveragePowerLevelL:(Float32*)averagePowerL averagePowerLevelR:(Float32*)averagePowerR peakHoldLevelL:(Float32*)peakLevelL peakHoldLevelR:(Float32*)peakLevelR {
+    return [self stereoAveragePowerLevelL:averagePowerL averagePowerLevelR:averagePowerR peakHoldLevelL:peakLevelL peakHoldLevelR:peakLevelR forGroup:_topGroup];
+}
+
 - (void)averagePowerLevel:(Float32*)averagePower peakHoldLevel:(Float32*)peakLevel forGroup:(AEChannelGroupRef)group {
     if ( !group->level_monitor_data.monitoringEnabled ) {
         if ( ![NSThread isMainThread] ) {
@@ -1623,6 +1665,37 @@ static BOOL AEAudioControllerHasPendingMainThreadMessages(AEAudioController *THI
     group->level_monitor_data.reset = YES;
 }
 
+- (void)stereoAveragePowerLevelL:(Float32*)averagePowerL averagePowerLevelR:(Float32*)averagePowerR peakHoldLevelL:(Float32*)peakLevelL peakHoldLevelR:(Float32*)peakLevelR forGroup:(AEChannelGroupRef)group {
+    if ( !group->stereo_level_monitor_data.monitoringEnabled ) {
+        if ( ![NSThread isMainThread] ) {
+            dispatch_async(dispatch_get_main_queue(), ^{ [self stereoAveragePowerLevelL:NULL averagePowerLevelR:NULL peakHoldLevelL:NULL peakHoldLevelR:NULL forGroup:group]; });
+        } else {
+            group->stereo_level_monitor_data.channels = group->channel->audioDescription.mChannelsPerFrame;
+            group->stereo_level_monitor_data.floatConverter = [[AEFloatConverter alloc] initWithSourceFormat:group->channel->audioDescription];
+            group->stereo_level_monitor_data.scratchBuffer = AEAllocateAndInitAudioBufferList(group->stereo_level_monitor_data.floatConverter.floatingPointAudioDescription, kLevelMonitorScratchBufferSize);
+            OSMemoryBarrier();
+            group->stereo_level_monitor_data.monitoringEnabled = YES;
+            
+            AEChannelGroupRef parentGroup = NULL;
+            int index=0;
+            if ( group != _topGroup ) {
+                parentGroup = [self searchForGroupContainingChannelMatchingPtr:group userInfo:NULL index:&index];
+                NSAssert(parentGroup != NULL, @"Channel group not found");
+            }
+            
+            [self configureChannelsInRange:NSMakeRange(index, 1) forGroup:parentGroup];
+            checkResult([self updateGraph], "Update graph");
+        }
+    }
+    
+    if ( averagePowerL ) *averagePowerL = 10.0 * log10((double)group->stereo_level_monitor_data.averageL);
+    if ( averagePowerR ) *averagePowerR = 10.0 * log10((double)group->stereo_level_monitor_data.averageR);
+    if ( peakLevelL ) *peakLevelL = 10.0 * log10((double)group->stereo_level_monitor_data.peakL);
+    if ( peakLevelR ) *peakLevelR = 10.0 * log10((double)group->stereo_level_monitor_data.peakR);
+    
+    group->stereo_level_monitor_data.reset = YES;
+}
+
 - (void)inputAveragePowerLevel:(Float32*)averagePower peakHoldLevel:(Float32*)peakLevel {
     if ( !_inputLevelMonitorData.monitoringEnabled ) {
         _inputLevelMonitorData.channels = _rawInputAudioDescription.mChannelsPerFrame;
@@ -1636,6 +1709,23 @@ static BOOL AEAudioControllerHasPendingMainThreadMessages(AEAudioController *THI
     if ( peakLevel ) *peakLevel = 10.0f * log10f(_inputLevelMonitorData.peak);
     
     _inputLevelMonitorData.reset = YES;
+}
+
+- (void)stereoInputAveragePowerLevelL:(Float32*)averagePowerL averagePowerLevelR:(Float32*)averagePowerR peakHoldLevelL:(Float32*)peakLevelL peakHoldLevelR:(Float32*)peakLevelR {
+    if ( !_stereoInputLevelMonitorData.monitoringEnabled ) {
+        _stereoInputLevelMonitorData.channels = _rawInputAudioDescription.mChannelsPerFrame;
+        _stereoInputLevelMonitorData.floatConverter = [[AEFloatConverter alloc] initWithSourceFormat:_rawInputAudioDescription];
+        _stereoInputLevelMonitorData.scratchBuffer = AEAllocateAndInitAudioBufferList(_stereoInputLevelMonitorData.floatConverter.floatingPointAudioDescription, kLevelMonitorScratchBufferSize);
+        OSMemoryBarrier();
+        _stereoInputLevelMonitorData.monitoringEnabled = YES;
+    }
+    
+    if ( averagePowerL ) *averagePowerL = 10.0 * log10((double)_stereoInputLevelMonitorData.averageL);
+    if ( averagePowerR ) *averagePowerR = 10.0 * log10((double)_stereoInputLevelMonitorData.averageR);
+    if ( peakLevelL ) *peakLevelL = 10.0 * log10((double)_stereoInputLevelMonitorData.peakL);
+    if ( peakLevelR ) *peakLevelR = 10.0 * log10((double)_stereoInputLevelMonitorData.peakR);
+    
+    _stereoInputLevelMonitorData.reset = YES;
 }
 
 #pragma mark - Utilities
@@ -2451,6 +2541,7 @@ NSTimeInterval AEAudioControllerOutputLatency(AEAudioController *controller) {
     AudioStreamBasicDescription rawAudioDescription = _rawInputAudioDescription;
     AudioBufferList *inputAudioBufferList           = _inputAudioBufferList;
     audio_level_monitor_t inputLevelMonitorData     = _inputLevelMonitorData;
+    stereo_audio_level_monitor_t stereoInputLevelMonitorData     = _stereoInputLevelMonitorData;
     
     BOOL inputChannelsChanged = _numberOfInputChannels != numberOfInputChannels;
     BOOL inputDescriptionChanged = inputChannelsChanged;
@@ -2523,6 +2614,11 @@ NSTimeInterval AEAudioControllerOutputLatency(AEAudioController *controller) {
                     inputLevelMonitorData.channels = rawAudioDescription.mChannelsPerFrame;
                     inputLevelMonitorData.floatConverter = [[AEFloatConverter alloc] initWithSourceFormat:rawAudioDescription];
                     inputLevelMonitorData.scratchBuffer = AEAllocateAndInitAudioBufferList(inputLevelMonitorData.floatConverter.floatingPointAudioDescription, kLevelMonitorScratchBufferSize);
+                }
+                if ( stereoInputLevelMonitorData.monitoringEnabled && memcmp(&_rawInputAudioDescription, &rawAudioDescription, sizeof(_rawInputAudioDescription)) != 0 ) {
+                    stereoInputLevelMonitorData.channels = rawAudioDescription.mChannelsPerFrame;
+                    stereoInputLevelMonitorData.floatConverter = [[AEFloatConverter alloc] initWithSourceFormat:rawAudioDescription];
+                    stereoInputLevelMonitorData.scratchBuffer = AEAllocateAndInitAudioBufferList(stereoInputLevelMonitorData.floatConverter.floatingPointAudioDescription, kLevelMonitorScratchBufferSize);
                 }
             }
             
@@ -2620,6 +2716,7 @@ NSTimeInterval AEAudioControllerOutputLatency(AEAudioController *controller) {
     input_callback_table_t *oldInputCallbacks = _inputCallbacks;
     int oldInputCallbackCount = _inputCallbackCount;
     audio_level_monitor_t oldInputLevelMonitorData = _inputLevelMonitorData;
+    stereo_audio_level_monitor_t oldStereoInputLevelMonitorData = _stereoInputLevelMonitorData;
     
     if ( _audiobusInputPort && usingAudiobus ) {
         AudioStreamBasicDescription clientFormat = [_audiobusInputPort clientFormat];
@@ -2639,6 +2736,7 @@ NSTimeInterval AEAudioControllerOutputLatency(AEAudioController *controller) {
         _inputCallbackCount       = inputCallbackCount;
         _usingAudiobusInput       = usingAudiobus;
         _inputLevelMonitorData    = inputLevelMonitorData;
+        _stereoInputLevelMonitorData    = stereoInputLevelMonitorData;
     }];
     
     if ( inputAvailable && (!_audiobusInputPort || !ABInputPortIsConnected(_audiobusInputPort)) ) {
@@ -2684,6 +2782,13 @@ NSTimeInterval AEAudioControllerOutputLatency(AEAudioController *controller) {
     }
     if ( oldInputLevelMonitorData.scratchBuffer != inputLevelMonitorData.scratchBuffer ) {
         AEFreeAudioBufferList(oldInputLevelMonitorData.scratchBuffer);
+    }
+
+    if ( oldStereoInputLevelMonitorData.floatConverter != stereoInputLevelMonitorData.floatConverter ) {
+        [oldStereoInputLevelMonitorData.floatConverter release];
+    }
+    if ( oldStereoInputLevelMonitorData.scratchBuffer != stereoInputLevelMonitorData.scratchBuffer ) {
+        AEFreeAudioBufferList(oldStereoInputLevelMonitorData.scratchBuffer);
     }
     
     if ( inputChannelsChanged ) {
@@ -2883,6 +2988,17 @@ NSTimeInterval AEAudioControllerOutputLatency(AEAudioController *controller) {
                 }
             }
             
+            if ( subgroup->stereo_level_monitor_data.monitoringEnabled ) {
+                // Update level monitoring converter to reflect new audio format
+                AudioStreamBasicDescription converterFormat = subgroup->stereo_level_monitor_data.floatConverter.sourceFormat;
+                if ( memcmp(&converterFormat, &channel->audioDescription, sizeof(channel->audioDescription)) != 0 ) {
+                    AEFloatConverter *newFloatConverter = [[AEFloatConverter alloc] initWithSourceFormat:channel->audioDescription];
+                    AEFloatConverter *oldFloatConverter = subgroup->stereo_level_monitor_data.floatConverter;
+                    [self performAsynchronousMessageExchangeWithBlock:^{ subgroup->stereo_level_monitor_data.floatConverter = newFloatConverter; }
+                                                        responseBlock:^{ [oldFloatConverter release]; }];
+                }
+            }
+            
             AUNode sourceNode = subgroup->converterNode ? subgroup->converterNode : subgroup->mixerNode;
             AudioUnit sourceUnit = subgroup->converterUnit ? subgroup->converterUnit : subgroup->mixerAudioUnit;
             
@@ -2920,7 +3036,7 @@ NSTimeInterval AEAudioControllerOutputLatency(AEAudioController *controller) {
                     upstreamInteraction.nodeInteractionType = kAUNodeInteraction_Connection;
                 }
                 
-                if ( hasReceivers || subgroup->level_monitor_data.monitoringEnabled ) {
+                if ( hasReceivers || subgroup->level_monitor_data.monitoringEnabled || subgroup->stereo_level_monitor_data.monitoringEnabled) {
                     if ( !channel->setRenderNotification ) {
                         // We need to register a callback to be notified when the mixer renders, to pass on the audio
                         checkResult(AudioUnitAddRenderNotify(sourceUnit, &groupRenderNotifyCallback, channel), "AudioUnitAddRenderNotify");
@@ -3094,6 +3210,14 @@ static void removeChannelsFromGroup(AEAudioController *THIS, AEChannelGroupRef g
         [group->level_monitor_data.floatConverter release];
     }
     memset(&group->level_monitor_data, 0, sizeof(audio_level_monitor_t));
+
+    if ( group->stereo_level_monitor_data.scratchBuffer ) {
+        AEFreeAudioBufferList(group->stereo_level_monitor_data.scratchBuffer);
+    }
+    if ( group->stereo_level_monitor_data.floatConverter ) {
+        [group->stereo_level_monitor_data.floatConverter release];
+    }
+    memset(&group->stereo_level_monitor_data, 0, sizeof(stereo_audio_level_monitor_t));
     
     for ( int i=0; i<group->channelCount; i++ ) {
         AEChannelRef channel = group->channels[i];
@@ -3365,6 +3489,47 @@ static void performLevelMonitoring(audio_level_monitor_t* monitor, AudioBufferLi
         monitor->meanAccumulator += avg;
         monitor->meanBlockCount++;
         monitor->average = monitor->meanAccumulator / (double)monitor->meanBlockCount;
+    }
+}
+
+static void performStereoLevelMonitoring(stereo_audio_level_monitor_t* monitor, AudioBufferList *buffer, UInt32 numberFrames) {
+    if ( !monitor->floatConverter || !monitor->scratchBuffer || monitor->channels != 2) return;
+    
+    if ( monitor->reset ) {
+        monitor->reset  = NO;
+        monitor->meanAccumulatorL = 0;
+        monitor->meanBlockCountL  = 0;
+        monitor->averageL         = 0;
+        monitor->peakL            = 0;
+        monitor->meanAccumulatorR = 0;
+        monitor->meanBlockCountR  = 0;
+        monitor->averageR         = 0;
+        monitor->peakR            = 0;
+    }
+    
+    UInt32 monitorFrames = min(numberFrames, kLevelMonitorScratchBufferSize);
+    AEFloatConverterToFloatBufferList(monitor->floatConverter, buffer, monitor->scratchBuffer, monitorFrames);
+
+    for ( int i=0; i<monitor->scratchBuffer->mNumberBuffers; i++ ) {
+        if (i == 0) {
+            float peak = 0.0;
+            vDSP_maxmgv((float*)monitor->scratchBuffer->mBuffers[i].mData, 1, &peak, monitorFrames);
+            if ( peak > monitor->peakL ) monitor->peakL = peak;
+            float avg = 0.0;
+            vDSP_meamgv((float*)monitor->scratchBuffer->mBuffers[i].mData, 1, &avg, monitorFrames);
+            monitor->meanAccumulatorL += avg;
+            monitor->meanBlockCountL++;
+            monitor->averageL = monitor->meanAccumulatorL / monitor->meanBlockCountL;
+        } else if (i == 1) {
+            float peak = 0.0;
+            vDSP_maxmgv((float*)monitor->scratchBuffer->mBuffers[i].mData, 1, &peak, monitorFrames);
+            if ( peak > monitor->peakR ) monitor->peakR = peak;
+            float avg = 0.0;
+            vDSP_meamgv((float*)monitor->scratchBuffer->mBuffers[i].mData, 1, &avg, monitorFrames);
+            monitor->meanAccumulatorR += avg;
+            monitor->meanBlockCountR++;
+            monitor->averageR = monitor->meanAccumulatorR / monitor->meanBlockCountR;
+        }
     }
 }
 
